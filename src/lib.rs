@@ -175,7 +175,7 @@ use crate::{
 
 pub struct DB<R, E>
 where
-    R: Record + 'static,
+    R: Record,
     E: Executor,
 {
     schema: Arc<RwLock<DbStorage<R>>>,
@@ -186,7 +186,7 @@ where
 
 impl<R, E> DB<R, E>
 where
-    R: Record + Send + Sync + 'static,
+    R: Record + Send + Sync,
     <R::Schema as Schema>::Columns: Send + Sync + 'static,
     E: Executor + Send + Sync + 'static,
 {
@@ -504,7 +504,7 @@ where
 
 pub(crate) struct DbStorage<R>
 where
-    R: Record + 'static,
+    R: Record,
 {
     pub mutable: MutableMemTable<R>,
     pub immutables: Vec<(Option<FileId>, Immutable<<R::Schema as Schema>::Columns>)>,

@@ -1,9 +1,10 @@
-use std::{cmp, collections::Bound, mem, sync::Arc, marker::PhantomData};
+use std::{cmp, collections::Bound, marker::PhantomData, mem, sync::Arc};
 
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
 use fusio_parquet::writer::AsyncWriter;
 use parquet::arrow::{AsyncArrowWriter, ProjectionMask};
 use crate::executor::Executor;
+use tracing::error;
 
 use super::Compactor;
 use crate::{
@@ -115,7 +116,7 @@ where
                         &scope.max,
                         &mut version_edits,
                         &mut delete_gens,
-                        &guard.record_schema,
+                        Arc::clone(&guard.record_schema),
                         &self.ctx,
                         executor,
                     )
@@ -210,7 +211,7 @@ where
         mut max: &<R::Schema as RecordSchema>::Key,
         version_edits: &mut Vec<VersionEdit<<R::Schema as RecordSchema>::Key>>,
         delete_gens: &mut Vec<(FileId, usize)>,
-        instance: &R::Schema,
+        instance: Arc<R::Schema>,
         ctx: &Context<R>,
         executor: Arc<E>,
     ) -> Result<(), CompactionError<R>> {
@@ -228,6 +229,8 @@ where
             let level_fs = ctx.manager.get_fs(level_path);
             let mut streams = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
             let mut streams1 = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
+        //    let mut streams2 = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
+
             // This Level
             if level == 0 {
                 for scope in meet_scopes_l.iter() {
@@ -269,6 +272,23 @@ where
                 streams.push(ScanStream::Level {
                     inner: level_scan_l,
                 });
+
+                let level_scan_l = LevelStream::new(
+                    version,
+                    level,
+                    start_l,
+                    end_l,
+                    (Bound::Included(lower), Bound::Included(upper)),
+                    u32::MAX.into(),
+                    None,
+                    ProjectionMask::all(),
+                    level_fs.clone(),
+                    ctx.parquet_lru.clone(),
+                )
+                .ok_or(CompactionError::EmptyLevel)?;
+                streams1.push(ScanStream::Level {
+                    inner: level_scan_l,
+                });
             }
             if !meet_scopes_ll.is_empty() {
                 // Next Level
@@ -290,6 +310,24 @@ where
                 streams.push(ScanStream::Level {
                     inner: level_scan_ll,
                 });
+
+                let level_scan_ll = LevelStream::new(
+                    version,
+                    level + 1,
+                    start_ll,
+                    end_ll,
+                    (Bound::Included(lower), Bound::Included(upper)),
+                    u32::MAX.into(),
+                    None,
+                    ProjectionMask::all(),
+                    level_fs.clone(),
+                    ctx.parquet_lru.clone(),
+                )
+                .ok_or(CompactionError::EmptyLevel)?;
+
+                streams1.push(ScanStream::Level {
+                    inner: level_scan_ll,
+                });
             }
 
             let level_l_path = option.level_fs_path(level + 1).unwrap_or(&option.base_path);
@@ -299,8 +337,9 @@ where
                 version_edits,
                 level + 1,
                 streams,
-                instance,
+                Arc::clone(&instance),
                 level_l_fs,
+                false,
             )
             .await?;
 
@@ -322,18 +361,21 @@ where
  
             let option_new = option.clone();
             let mut version_edits_new = version_edits.clone();
-            let instance_new = (*instance).clone();
-            let level_l_remote_fs = ctx.manager.get_fs(level_l_path).clone(); //改成S3上的路径
+            let level_l_remote_fs = ctx.manager.get_fs(level_l_path).clone();
+            let instance_new = Arc::clone(&instance);
             executor.spawn(async move {
-                Compactor::<R, E>::build_tables(
+                if let Err(err) = Compactor::<R, E>::build_tables(
                     &option_new, 
                     &mut version_edits_new,
                     level + 1,
                     streams1,
                     instance_new,
                     &level_l_remote_fs,
+                    true,
                 )
-                .await;
+                .await {
+                    error!("[Compaction Upload Error]: {}", err);
+                }
                 // 上传到S3
             }); 
         }
@@ -729,7 +771,7 @@ pub(crate) mod tests {
             &max,
             &mut version_edits,
             &mut vec![],
-            &TestSchema,
+            Arc::new(TestSchema),
             &ctx,
             Arc::new(TokioExecutor::current()),
         )
@@ -878,7 +920,7 @@ pub(crate) mod tests {
             &max,
             &mut version_edits,
             &mut vec![],
-            &TestSchema,
+            Arc::new(TestSchema),
             &ctx,
             Arc::new(TokioExecutor::current()),
         )

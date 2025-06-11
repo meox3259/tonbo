@@ -3,6 +3,7 @@ use std::{
     collections::BinaryHeap,
     pin::Pin,
     task::{Context, Poll},
+    sync::Arc,
 };
 
 use futures_core::{ready, Stream};

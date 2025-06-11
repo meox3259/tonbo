@@ -23,7 +23,7 @@ use crate::{
 
 pub(crate) enum Compactor<R, E>
 where
-    R: Record + 'static,
+    R: Record,
     E: Executor + Send + Sync + 'static,
 {
     Leveled(LeveledCompactor<R, E>),
@@ -55,8 +55,9 @@ where
         version_edits: &mut Vec<VersionEdit<<R::Schema as RecordSchema>::Key>>,
         level: usize,
         streams: Vec<ScanStream<'scan, R>>,
-        schema: &R::Schema,
+        schema: Arc<R::Schema>,
         fs: &Arc<dyn DynFs>,
+        modify_manifest: bool,
     ) -> Result<(), CompactionError<R>> {
         let mut stream = MergeStream::<R>::from_vec(streams, u32::MAX.into()).await?;
 
@@ -84,7 +85,7 @@ where
                     &mut builder,
                     &mut min,
                     &mut max,
-                    schema,
+                    schema.clone(),
                     fs,
                 )
                 .await?;
@@ -128,7 +129,7 @@ where
         builder: &mut <<R::Schema as RecordSchema>::Columns as ArrowArrays>::Builder,
         min: &mut Option<<R::Schema as RecordSchema>::Key>,
         max: &mut Option<<R::Schema as RecordSchema>::Key>,
-        schema: &R::Schema,
+        schema: Arc<R::Schema>,
         fs: &Arc<dyn DynFs>,
     ) -> Result<(), CompactionError<R>> {
         debug_assert!(min.is_some());
