@@ -1,8 +1,9 @@
-use std::{cmp, collections::Bound, mem, sync::Arc};
+use std::{cmp, collections::Bound, mem, sync::Arc, marker::PhantomData};
 
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
 use fusio_parquet::writer::AsyncWriter;
 use parquet::arrow::{AsyncArrowWriter, ProjectionMask};
+use crate::executor::Executor;
 
 use super::Compactor;
 use crate::{
@@ -18,19 +19,23 @@ use crate::{
     DbOption, DbStorage,
 };
 
-pub(crate) struct LeveledCompactor<R>
+pub(crate) struct LeveledCompactor<R, E>
 where
-    R: Record,
+    R: Record + Send + 'static,
+    E: Executor + Send + Sync + 'static,
 {
     option: Arc<DbOption>,
     schema: Arc<RwLock<DbStorage<R>>>,
     ctx: Arc<Context<R>>,
     record_schema: Arc<R::Schema>,
+    _p: PhantomData<E>,
 }
 
-impl<R> LeveledCompactor<R>
+impl<R, E> LeveledCompactor<R, E>
 where
-    R: Record,
+    R: Record + Send + 'static,
+    E: Executor + Send + Sync + 'static,
+    R::Schema: 'static,
 {
     pub(crate) fn new(
         schema: Arc<RwLock<DbStorage<R>>>,
@@ -38,17 +43,19 @@ where
         option: Arc<DbOption>,
         ctx: Arc<Context<R>>,
     ) -> Self {
-        LeveledCompactor::<R> {
+        LeveledCompactor::<R, E> {
             option,
             schema,
             ctx,
             record_schema,
+            _p: PhantomData,
         }
     }
 
     pub(crate) async fn check_then_compaction(
         &mut self,
         is_manual: bool,
+        executor: Arc<E>,
     ) -> Result<(), CompactionError<R>> {
         let mut guard = self.schema.write().await;
 
@@ -110,6 +117,7 @@ where
                         &mut delete_gens,
                         &guard.record_schema,
                         &self.ctx,
+                        executor,
                     )
                     .await?;
                 }
@@ -204,6 +212,7 @@ where
         delete_gens: &mut Vec<(FileId, usize)>,
         instance: &R::Schema,
         ctx: &Context<R>,
+        executor: Arc<E>,
     ) -> Result<(), CompactionError<R>> {
         let mut level = 0;
 
@@ -218,6 +227,7 @@ where
             let level_path = option.level_fs_path(level).unwrap_or(&option.base_path);
             let level_fs = ctx.manager.get_fs(level_path);
             let mut streams = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
+            let mut streams1 = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
             // This Level
             if level == 0 {
                 for scope in meet_scopes_l.iter() {
@@ -241,7 +251,7 @@ where
                     });
                 }
             } else {
-                let (lower, upper) = Compactor::<R>::full_scope(&meet_scopes_l)?;
+                let (lower, upper) = Compactor::<R, E>::full_scope(&meet_scopes_l)?;
                 let level_scan_l = LevelStream::new(
                     version,
                     level,
@@ -262,7 +272,7 @@ where
             }
             if !meet_scopes_ll.is_empty() {
                 // Next Level
-                let (lower, upper) = Compactor::<R>::full_scope(&meet_scopes_ll)?;
+                let (lower, upper) = Compactor::<R, E>::full_scope(&meet_scopes_ll)?;
                 let level_scan_ll = LevelStream::new(
                     version,
                     level + 1,
@@ -284,7 +294,7 @@ where
 
             let level_l_path = option.level_fs_path(level + 1).unwrap_or(&option.base_path);
             let level_l_fs = ctx.manager.get_fs(level_l_path);
-            Compactor::<R>::build_tables(
+            Compactor::<R, E>::build_tables(
                 option,
                 version_edits,
                 level + 1,
@@ -309,6 +319,23 @@ where
                 delete_gens.push((scope.gen, level + 1));
             }
             level += 1;
+ 
+            let option_new = option.clone();
+            let mut version_edits_new = version_edits.clone();
+            let instance_new = (*instance).clone();
+            let level_l_remote_fs = ctx.manager.get_fs(level_l_path).clone(); //改成S3上的路径
+            executor.spawn(async move {
+                Compactor::<R, E>::build_tables(
+                    &option_new, 
+                    &mut version_edits_new,
+                    level + 1,
+                    streams1,
+                    instance_new,
+                    &level_l_remote_fs,
+                )
+                .await;
+                // 上传到S3
+            }); 
         }
 
         Ok(())
@@ -552,7 +579,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let scope = LeveledCompactor::<Test>::minor_compaction(
+        let scope = LeveledCompactor::<Test, TokioExecutor>::minor_compaction(
             &option,
             None,
             &vec![
@@ -615,7 +642,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-        let scope = LeveledCompactor::<DynRecord>::minor_compaction(
+        let scope = LeveledCompactor::<DynRecord, TokioExecutor>::minor_compaction(
             &option,
             None,
             &vec![
@@ -695,7 +722,7 @@ pub(crate) mod tests {
             TestSchema.arrow_schema().clone(),
         );
 
-        LeveledCompactor::<Test>::major_compaction(
+        LeveledCompactor::<Test, TokioExecutor>::major_compaction(
             &version,
             &option,
             &min,
@@ -704,6 +731,7 @@ pub(crate) mod tests {
             &mut vec![],
             &TestSchema,
             &ctx,
+            Arc::new(TokioExecutor::current()),
         )
         .await
         .unwrap();
@@ -843,7 +871,7 @@ pub(crate) mod tests {
             version_set,
             TestSchema.arrow_schema().clone(),
         );
-        LeveledCompactor::<Test>::major_compaction(
+        LeveledCompactor::<Test, TokioExecutor>::major_compaction(
             &version,
             &option,
             &min,
@@ -852,6 +880,7 @@ pub(crate) mod tests {
             &mut vec![],
             &TestSchema,
             &ctx,
+            Arc::new(TokioExecutor::current()),
         )
         .await
         .unwrap();

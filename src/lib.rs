@@ -175,7 +175,7 @@ use crate::{
 
 pub struct DB<R, E>
 where
-    R: Record,
+    R: Record + 'static,
     E: Executor,
 {
     schema: Arc<RwLock<DbStorage<R>>>,
@@ -186,8 +186,8 @@ where
 
 impl<R, E> DB<R, E>
 where
-    R: Record + Send + Sync,
-    <R::Schema as Schema>::Columns: Send + Sync,
+    R: Record + Send + Sync + 'static,
+    <R::Schema as Schema>::Columns: Send + Sync + 'static,
     E: Executor + Send + Sync + 'static,
 {
     /// Open [`DB`] with a [`DbOption`]. This will create a new directory at the
@@ -267,7 +267,7 @@ where
             record_schema.arrow_schema().clone(),
         ));
         let mut compactor = match option.compaction_option {
-            CompactionOption::Leveled => Compactor::Leveled(LeveledCompactor::<R>::new(
+            CompactionOption::Leveled => Compactor::Leveled(LeveledCompactor::<R, E>::new(
                 schema.clone(),
                 record_schema,
                 option.clone(),
@@ -275,18 +275,20 @@ where
             )),
         };
 
-        executor.spawn(async move {
+        let executor_arc = Arc::new(executor);
+        executor_arc.spawn(async move {
             if let Err(err) = cleaner.listen().await {
                 error!("[Cleaner Error]: {}", err)
             }
         });
 
-        executor.spawn(async move {
+        let executor_arc_clone = Arc::clone(&executor_arc);
+        executor_arc.spawn(async move {
             while let Ok(task) = task_rx.recv_async().await {
                 if let Err(err) = match task {
-                    CompactTask::Freeze => compactor.check_then_compaction(false).await,
+                    CompactTask::Freeze => compactor.check_then_compaction(false, Arc::clone(&executor_arc_clone)).await,
                     CompactTask::Flush(option_tx) => {
-                        let mut result = compactor.check_then_compaction(true).await;
+                        let mut result = compactor.check_then_compaction(true, Arc::clone(&executor_arc_clone)).await;
                         if let Some(tx) = option_tx {
                             if result.is_ok() {
                                 result = tx.send(()).map_err(|_| CompactionError::ChannelClose);
@@ -502,7 +504,7 @@ where
 
 pub(crate) struct DbStorage<R>
 where
-    R: Record,
+    R: Record + 'static,
 {
     pub mutable: MutableMemTable<R>,
     pub immutables: Vec<(Option<FileId>, Immutable<<R::Schema as Schema>::Columns>)>,
@@ -1407,7 +1409,7 @@ pub(crate) mod tests {
             TestSchema.arrow_schema().clone(),
         ));
         let mut compactor = match option.compaction_option {
-            CompactionOption::Leveled => Compactor::Leveled(LeveledCompactor::<R>::new(
+            CompactionOption::Leveled => Compactor::Leveled(LeveledCompactor::<R, E>::new(
                 schema.clone(),
                 record_schema,
                 option.clone(),
@@ -1415,17 +1417,19 @@ pub(crate) mod tests {
             )),
         };
 
-        executor.spawn(async move {
+        let executor_arc = Arc::new(executor);
+        executor_arc.spawn(async move {
             if let Err(err) = cleaner.listen().await {
                 error!("[Cleaner Error]: {}", err)
             }
         });
-        executor.spawn(async move {
+        let executor_arc_clone = Arc::clone(&executor_arc);
+        executor_arc.spawn(async move {
             while let Ok(task) = compaction_rx.recv_async().await {
                 if let Err(err) = match task {
-                    CompactTask::Freeze => compactor.check_then_compaction(false).await,
+                    CompactTask::Freeze => compactor.check_then_compaction(false, Arc::clone(&executor_arc_clone)).await,
                     CompactTask::Flush(option_tx) => {
-                        let mut result = compactor.check_then_compaction(true).await;
+                        let mut result = compactor.check_then_compaction(true, Arc::clone(&executor_arc_clone)).await;
                         if let Some(tx) = option_tx {
                             let channel_result =
                                 tx.send(()).map_err(|_| CompactionError::ChannelClose);

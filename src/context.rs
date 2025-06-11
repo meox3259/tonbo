@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
+use tokio::task::JoinHandle;
 
 use arrow::datatypes::Schema;
-
 use crate::{
     fs::manager::StoreManager,
     record::Record,
@@ -15,6 +15,7 @@ pub(crate) struct Context<R: Record> {
     pub(crate) parquet_lru: ParquetLru,
     pub(crate) version_set: VersionSet<R>,
     pub(crate) arrow_schema: Arc<Schema>,
+    pub(crate) spawn_upload: VecDeque<JoinHandle<()>>, // 只记录返回状态
 }
 
 impl<R> Context<R>
@@ -32,6 +33,7 @@ where
             parquet_lru,
             version_set,
             arrow_schema,
+            spawn_upload: VecDeque::new(),
         }
     }
 

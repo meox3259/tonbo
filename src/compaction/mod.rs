@@ -8,6 +8,7 @@ use leveled::LeveledCompactor;
 use parquet::arrow::AsyncArrowWriter;
 use thiserror::Error;
 use tokio::sync::oneshot;
+use crate::executor::Executor;
 
 use crate::{
     fs::{generate_file_id, FileType},
@@ -20,11 +21,12 @@ use crate::{
     DbOption,
 };
 
-pub(crate) enum Compactor<R>
+pub(crate) enum Compactor<R, E>
 where
-    R: Record,
+    R: Record + 'static,
+    E: Executor + Send + Sync + 'static,
 {
-    Leveled(LeveledCompactor<R>),
+    Leveled(LeveledCompactor<R, E>),
 }
 
 #[derive(Debug)]
@@ -33,16 +35,18 @@ pub enum CompactTask {
     Flush(Option<oneshot::Sender<()>>),
 }
 
-impl<R> Compactor<R>
+impl<R, E> Compactor<R, E>
 where
     R: Record,
+    E: Executor + Send + Sync + 'static,
 {
     pub(crate) async fn check_then_compaction(
         &mut self,
         is_manual: bool,
+        executor: Arc<E>,
     ) -> Result<(), CompactionError<R>> {
         match self {
-            Compactor::Leveled(leveled) => leveled.check_then_compaction(is_manual).await,
+            Compactor::Leveled(leveled) => leveled.check_then_compaction(is_manual, executor).await,
         }
     }
 

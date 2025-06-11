@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::inmem::immutable::ArrowArrays;
 
-pub trait Schema: Debug + Send + Sync {
+pub trait Schema: Debug + Send + Sync + 'static {
     type Record: Record<Schema = Self>;
 
     type Columns: ArrowArrays<Record = Self::Record>;
