@@ -1,14 +1,15 @@
 pub(crate) mod leveled;
 use std::{pin::Pin, sync::Arc};
 
+use crate::executor::Executor;
 use fusio::DynFs;
 use fusio_parquet::writer::AsyncWriter;
 use futures_util::StreamExt;
 use leveled::LeveledCompactor;
+use log::error;
 use parquet::arrow::AsyncArrowWriter;
 use thiserror::Error;
 use tokio::sync::oneshot;
-use crate::executor::Executor;
 
 use crate::{
     fs::{generate_file_id, FileType},
@@ -37,8 +38,9 @@ pub enum CompactTask {
 
 impl<R, E> Compactor<R, E>
 where
-    R: Record,
+    R: Record + Send + Sync,
     E: Executor + Send + Sync + 'static,
+    //   <<R::Schema as RecordSchema>::Columns as ArrowArrays>::Builder: Send + Sync,
 {
     pub(crate) async fn check_then_compaction(
         &mut self,
@@ -51,13 +53,15 @@ where
     }
 
     async fn build_tables<'scan>(
-        option: &DbOption,
+        option: &Arc<DbOption>,
         version_edits: &mut Vec<VersionEdit<<R::Schema as RecordSchema>::Key>>,
         level: usize,
         streams: Vec<ScanStream<'scan, R>>,
-        schema: Arc<R::Schema>,
+        schema: &Arc<R::Schema>,
         fs: &Arc<dyn DynFs>,
-        modify_manifest: bool,
+        cache: &Arc<dyn DynFs>,
+        executor: &Arc<E>,
+        cached_to_local: bool,
     ) -> Result<(), CompactionError<R>> {
         let mut stream = MergeStream::<R>::from_vec(streams, u32::MAX.into()).await?;
 
@@ -66,7 +70,8 @@ where
             <R::Schema as RecordSchema>::Columns::builder(schema.arrow_schema().clone(), 8192);
         let mut min = None;
         let mut max = None;
-
+        let mut build_table_count = 0;
+        let (sender, receiver) = flume::unbounded();
         while let Some(result) = Pin::new(&mut stream).next().await {
             let entry = result?;
             let key = entry.key();
@@ -78,31 +83,104 @@ where
             builder.push(key, entry.value());
 
             if builder.written_size() >= option.max_sst_file_size {
+                let columns = Arc::new(builder.finish(None));
                 Self::build_table(
                     option,
                     version_edits,
                     level,
-                    &mut builder,
+                    &columns,
                     &mut min,
                     &mut max,
-                    schema.clone(),
-                    fs,
+                    &schema,
+                    cache,
+                    !cached_to_local,
                 )
                 .await?;
+                if cached_to_local {
+                    build_table_count += 1;
+                    let option = Arc::clone(option);
+                    let mut version_edits = version_edits.clone();
+                    let schema = schema.clone();
+                    let fs = Arc::clone(fs);
+                    let mut min = min.clone();
+                    let mut max = max.clone();
+                    let sender = sender.clone();
+                    executor.spawn(async move {
+                        if let Err(e) = Self::build_table(
+                            &option,
+                            &mut version_edits,
+                            level,
+                            &columns,
+                            &mut min,
+                            &mut max,
+                            &schema,
+                            &fs,
+                            cached_to_local,
+                        )
+                        .await
+                        {
+                            error!("Build Table Error: {}", e);
+                        }
+                        if let Err(e) = sender.send(1) {
+                            error!("Send To Channel Error: {}", e);
+                        }
+                    });
+                }
             }
         }
         if builder.written_size() > 0 {
+            let columns = Arc::new(builder.finish(None));
             Self::build_table(
                 option,
                 version_edits,
                 level,
-                &mut builder,
+                &columns,
                 &mut min,
                 &mut max,
                 schema,
-                fs,
+                cache,
+                !cached_to_local,
             )
             .await?;
+            if cached_to_local {
+                build_table_count += 1;
+                let option = Arc::clone(option);
+                let mut version_edits = version_edits.clone();
+                let schema = schema.clone();
+                let fs = Arc::clone(fs);
+                let mut min = min.clone();
+                let mut max = max.clone();
+                executor.spawn(async move {
+                    if let Err(e) = Self::build_table(
+                        &option,
+                        &mut version_edits,
+                        level,
+                        &columns,
+                        &mut min,
+                        &mut max,
+                        &schema,
+                        &fs,
+                        cached_to_local,
+                    )
+                    .await
+                    {
+                        error!("Build Table Error: {}", e);
+                    }
+                    if let Err(e) = sender.send(1) {
+                        error!("Send To Channel Error: {}", e);
+                    }
+                });
+            }
+        }
+
+        if cached_to_local {
+            while let Ok(_) = receiver.recv() {
+                build_table_count -= 1;
+
+                if build_table_count == 0 {
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -126,17 +204,17 @@ where
         option: &DbOption,
         version_edits: &mut Vec<VersionEdit<<R::Schema as RecordSchema>::Key>>,
         level: usize,
-        builder: &mut <<R::Schema as RecordSchema>::Columns as ArrowArrays>::Builder,
+        columns: &Arc<<<R as Record>::Schema as RecordSchema>::Columns>,
         min: &mut Option<<R::Schema as RecordSchema>::Key>,
         max: &mut Option<<R::Schema as RecordSchema>::Key>,
-        schema: Arc<R::Schema>,
+        schema: &R::Schema,
         fs: &Arc<dyn DynFs>,
+        modify_manifest: bool,
     ) -> Result<(), CompactionError<R>> {
         debug_assert!(min.is_some());
         debug_assert!(max.is_some());
 
         let gen = generate_file_id();
-        let columns = builder.finish(None);
         let mut writer = AsyncArrowWriter::try_new(
             AsyncWriter::new(
                 fs.open_options(
@@ -150,15 +228,18 @@ where
         )?;
         writer.write(columns.as_record_batch()).await?;
         writer.close().await?;
-        version_edits.push(VersionEdit::Add {
-            level: level as u8,
-            scope: Scope {
-                min: min.take().ok_or(CompactionError::EmptyLevel)?,
-                max: max.take().ok_or(CompactionError::EmptyLevel)?,
-                gen,
-                wal_ids: None,
-            },
-        });
+
+        if modify_manifest {
+            version_edits.push(VersionEdit::Add {
+                level: level as u8,
+                scope: Scope {
+                    min: min.take().ok_or(CompactionError::EmptyLevel)?,
+                    max: max.take().ok_or(CompactionError::EmptyLevel)?,
+                    gen,
+                    wal_ids: None,
+                },
+            });
+        }
         Ok(())
     }
 }

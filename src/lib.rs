@@ -286,9 +286,15 @@ where
         executor_arc.spawn(async move {
             while let Ok(task) = task_rx.recv_async().await {
                 if let Err(err) = match task {
-                    CompactTask::Freeze => compactor.check_then_compaction(false, Arc::clone(&executor_arc_clone)).await,
+                    CompactTask::Freeze => {
+                        compactor
+                            .check_then_compaction(false, Arc::clone(&executor_arc_clone))
+                            .await
+                    }
                     CompactTask::Flush(option_tx) => {
-                        let mut result = compactor.check_then_compaction(true, Arc::clone(&executor_arc_clone)).await;
+                        let mut result = compactor
+                            .check_then_compaction(true, Arc::clone(&executor_arc_clone))
+                            .await;
                         if let Some(tx) = option_tx {
                             if result.is_ok() {
                                 result = tx.send(()).map_err(|_| CompactionError::ChannelClose);
@@ -1427,9 +1433,15 @@ pub(crate) mod tests {
         executor_arc.spawn(async move {
             while let Ok(task) = compaction_rx.recv_async().await {
                 if let Err(err) = match task {
-                    CompactTask::Freeze => compactor.check_then_compaction(false, Arc::clone(&executor_arc_clone)).await,
+                    CompactTask::Freeze => {
+                        compactor
+                            .check_then_compaction(false, Arc::clone(&executor_arc_clone))
+                            .await
+                    }
                     CompactTask::Flush(option_tx) => {
-                        let mut result = compactor.check_then_compaction(true, Arc::clone(&executor_arc_clone)).await;
+                        let mut result = compactor
+                            .check_then_compaction(true, Arc::clone(&executor_arc_clone))
+                            .await;
                         if let Some(tx) = option_tx {
                             let channel_result =
                                 tx.send(()).map_err(|_| CompactionError::ChannelClose);
@@ -1474,7 +1486,7 @@ pub(crate) mod tests {
         let path_l0 = Path::from_filesystem_path(temp_dir_l0.path()).unwrap();
 
         let mut option = DbOption::new(path, &TestSchema)
-            .level_path(0, path_l0, FsOptions::Local)
+            .level_path(0, path_l0, FsOptions::Local, false)
             .unwrap();
         option.immutable_chunk_num = 1;
         option.immutable_chunk_max_num = 1;

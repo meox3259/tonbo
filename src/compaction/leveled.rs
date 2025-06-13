@@ -1,10 +1,9 @@
 use std::{cmp, collections::Bound, marker::PhantomData, mem, sync::Arc};
 
+use crate::executor::Executor;
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
 use fusio_parquet::writer::AsyncWriter;
 use parquet::arrow::{AsyncArrowWriter, ProjectionMask};
-use crate::executor::Executor;
-use tracing::error;
 
 use super::Compactor;
 use crate::{
@@ -34,7 +33,7 @@ where
 
 impl<R, E> LeveledCompactor<R, E>
 where
-    R: Record + Send + 'static,
+    R: Record + Send + Sync + 'static,
     E: Executor + Send + Sync + 'static,
     R::Schema: 'static,
 {
@@ -116,9 +115,10 @@ where
                         &scope.max,
                         &mut version_edits,
                         &mut delete_gens,
-                        Arc::clone(&guard.record_schema),
+                        &guard.record_schema,
                         &self.ctx,
-                        executor,
+                        &executor,
+                        false,
                     )
                     .await?;
                 }
@@ -126,7 +126,6 @@ where
                 version_edits.push(VersionEdit::LatestTimeStamp {
                     ts: version_ref.increase_ts(),
                 });
-
                 self.ctx
                     .version_set
                     .apply_edits(version_edits, Some(delete_gens), false)
@@ -206,14 +205,15 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn major_compaction(
         version: &Version<R>,
-        option: &DbOption,
+        option: &Arc<DbOption>,
         mut min: &<R::Schema as RecordSchema>::Key,
         mut max: &<R::Schema as RecordSchema>::Key,
         version_edits: &mut Vec<VersionEdit<<R::Schema as RecordSchema>::Key>>,
         delete_gens: &mut Vec<(FileId, usize)>,
-        instance: Arc<R::Schema>,
+        instance: &Arc<R::Schema>,
         ctx: &Context<R>,
-        executor: Arc<E>,
+        executor: &Arc<E>,
+        cached_to_local: bool,
     ) -> Result<(), CompactionError<R>> {
         let mut level = 0;
 
@@ -226,11 +226,9 @@ where
                 Self::next_level_scopes(version, &mut min, &mut max, level, &meet_scopes_l)?;
 
             let level_path = option.level_fs_path(level).unwrap_or(&option.base_path);
+
             let level_fs = ctx.manager.get_fs(level_path);
             let mut streams = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
-            let mut streams1 = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
-        //    let mut streams2 = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
-
             // This Level
             if level == 0 {
                 for scope in meet_scopes_l.iter() {
@@ -272,23 +270,6 @@ where
                 streams.push(ScanStream::Level {
                     inner: level_scan_l,
                 });
-
-                let level_scan_l = LevelStream::new(
-                    version,
-                    level,
-                    start_l,
-                    end_l,
-                    (Bound::Included(lower), Bound::Included(upper)),
-                    u32::MAX.into(),
-                    None,
-                    ProjectionMask::all(),
-                    level_fs.clone(),
-                    ctx.parquet_lru.clone(),
-                )
-                .ok_or(CompactionError::EmptyLevel)?;
-                streams1.push(ScanStream::Level {
-                    inner: level_scan_l,
-                });
             }
             if !meet_scopes_ll.is_empty() {
                 // Next Level
@@ -310,39 +291,23 @@ where
                 streams.push(ScanStream::Level {
                     inner: level_scan_ll,
                 });
-
-                let level_scan_ll = LevelStream::new(
-                    version,
-                    level + 1,
-                    start_ll,
-                    end_ll,
-                    (Bound::Included(lower), Bound::Included(upper)),
-                    u32::MAX.into(),
-                    None,
-                    ProjectionMask::all(),
-                    level_fs.clone(),
-                    ctx.parquet_lru.clone(),
-                )
-                .ok_or(CompactionError::EmptyLevel)?;
-
-                streams1.push(ScanStream::Level {
-                    inner: level_scan_ll,
-                });
             }
 
             let level_l_path = option.level_fs_path(level + 1).unwrap_or(&option.base_path);
             let level_l_fs = ctx.manager.get_fs(level_l_path);
+            let level_l_cache = ctx.manager.get_cache(level_l_path);
             Compactor::<R, E>::build_tables(
                 option,
                 version_edits,
                 level + 1,
                 streams,
-                Arc::clone(&instance),
+                instance,
                 level_l_fs,
-                false,
+                level_l_cache,
+                &executor,
+                cached_to_local,
             )
             .await?;
-
             for scope in meet_scopes_l {
                 version_edits.push(VersionEdit::Remove {
                     level: level as u8,
@@ -358,26 +323,6 @@ where
                 delete_gens.push((scope.gen, level + 1));
             }
             level += 1;
- 
-            let option_new = option.clone();
-            let mut version_edits_new = version_edits.clone();
-            let level_l_remote_fs = ctx.manager.get_fs(level_l_path).clone();
-            let instance_new = Arc::clone(&instance);
-            executor.spawn(async move {
-                if let Err(err) = Compactor::<R, E>::build_tables(
-                    &option_new, 
-                    &mut version_edits_new,
-                    level + 1,
-                    streams1,
-                    instance_new,
-                    &level_l_remote_fs,
-                    true,
-                )
-                .await {
-                    error!("[Compaction Upload Error]: {}", err);
-                }
-                // 上传到S3
-            }); 
         }
 
         Ok(())
@@ -475,12 +420,11 @@ where
 
 #[cfg(all(test, feature = "tokio"))]
 pub(crate) mod tests {
-    use std::sync::{atomic::AtomicU32, Arc};
-
     use flume::bounded;
     use fusio::{path::Path, DynFs};
     use fusio_dispatch::FsOptions;
     use parquet_lru::NoCache;
+    use std::sync::{atomic::AtomicU32, Arc};
     use tempfile::TempDir;
 
     use crate::{
@@ -537,6 +481,7 @@ pub(crate) mod tests {
             0,
             Path::from_filesystem_path(temp_dir_l0.path()).unwrap(),
             FsOptions::Local,
+            false,
         )
         .unwrap();
         let manager =
@@ -708,11 +653,39 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn major_compaction() {
+    async fn major_compaction_cached() {
+        use fusio::remotes::aws::AwsCredential;
+
+        if option_env!("AWS_ACCESS_KEY_ID").is_none()
+            || option_env!("AWS_SECRET_ACCESS_KEY").is_none()
+        {
+            eprintln!("can not get `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`");
+            return;
+        }
+        let key_id = std::option_env!("AWS_ACCESS_KEY_ID").unwrap().to_string();
+        let secret_key = std::option_env!("AWS_SECRET_ACCESS_KEY")
+            .unwrap()
+            .to_string();
+        let token = None;
+        let bucket = std::env::var("BUCKET_NAME").expect("expected s3 bucket not to be empty");
+        let region = Some(std::env::var("AWS_REGION").expect("expected s3 region not to be empty"));
+
+        let fs_option = fusio_log::FsOptions::S3 {
+            bucket,
+            credential: Some(AwsCredential {
+                key_id,
+                secret_key,
+                token,
+            }),
+            endpoint: None,
+            sign_payload: None,
+            checksum: None,
+            region,
+        };
+
         let temp_dir = TempDir::new().unwrap();
         let temp_dir_l0 = TempDir::new().unwrap();
         let temp_dir_l1 = TempDir::new().unwrap();
-
         let mut option = DbOption::new(
             Path::from_filesystem_path(temp_dir.path()).unwrap(),
             &TestSchema,
@@ -720,13 +693,15 @@ pub(crate) mod tests {
         .level_path(
             0,
             Path::from_filesystem_path(temp_dir_l0.path()).unwrap(),
-            FsOptions::Local,
+            fs_option.clone(),
+            false,
         )
         .unwrap()
         .level_path(
             1,
-            Path::from_filesystem_path(temp_dir_l1.path()).unwrap(),
-            FsOptions::Local,
+            Path::from_url_path("tonbo/dadsa").unwrap(),
+            fs_option.clone(),
+            false,
         )
         .unwrap();
         option.major_threshold_with_sst_size = 2;
@@ -764,6 +739,8 @@ pub(crate) mod tests {
             TestSchema.arrow_schema().clone(),
         );
 
+        let executor = Arc::new(TokioExecutor::current());
+        println!("start major compaction");
         LeveledCompactor::<Test, TokioExecutor>::major_compaction(
             &version,
             &option,
@@ -771,13 +748,117 @@ pub(crate) mod tests {
             &max,
             &mut version_edits,
             &mut vec![],
-            Arc::new(TestSchema),
+            &Arc::new(TestSchema),
             &ctx,
-            Arc::new(TokioExecutor::current()),
+            &executor,
+            false,
         )
         .await
         .unwrap();
+        println!("end major compaction");
+        if let VersionEdit::Add { level, scope } = &version_edits[0] {
+            assert_eq!(*level, 1);
+            assert_eq!(scope.min, 1.to_string());
+            assert_eq!(scope.max, 6.to_string());
+        }
+        assert_eq!(
+            version_edits[1..5].to_vec(),
+            vec![
+                VersionEdit::Remove {
+                    level: 0,
+                    gen: table_gen_1,
+                },
+                VersionEdit::Remove {
+                    level: 0,
+                    gen: table_gen_2,
+                },
+                VersionEdit::Remove {
+                    level: 1,
+                    gen: table_gen_3,
+                },
+                VersionEdit::Remove {
+                    level: 1,
+                    gen: table_gen_4,
+                },
+            ]
+        );
+    }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn major_compaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_dir_l0 = TempDir::new().unwrap();
+        let temp_dir_l1 = TempDir::new().unwrap();
+        let mut option = DbOption::new(
+            Path::from_filesystem_path(temp_dir.path()).unwrap(),
+            &TestSchema,
+        )
+        .level_path(
+            0,
+            Path::from_filesystem_path(temp_dir_l0.path()).unwrap(),
+            FsOptions::Local,
+            false,
+        )
+        .unwrap()
+        .level_path(
+            1,
+            Path::from_filesystem_path(temp_dir_l1.path()).unwrap(),
+            FsOptions::Local,
+            false,
+        )
+        .unwrap();
+        option.major_threshold_with_sst_size = 2;
+        let option = Arc::new(option);
+        let manager = Arc::new(
+            StoreManager::new(option.base_fs.clone(), option.level_paths.clone()).unwrap(),
+        );
+
+        manager
+            .base_fs()
+            .create_dir_all(&option.version_log_dir_path())
+            .await
+            .unwrap();
+        manager
+            .base_fs()
+            .create_dir_all(&option.wal_dir_path())
+            .await
+            .unwrap();
+
+        let ((table_gen_1, table_gen_2, table_gen_3, table_gen_4, _), version) =
+            build_version(&option, &manager, &Arc::new(TestSchema)).await;
+
+        let min = 2.to_string();
+        let max = 5.to_string();
+        let mut version_edits = Vec::new();
+
+        let (_, clean_sender) = Cleaner::new(option.clone(), manager.clone());
+        let version_set = VersionSet::new(clean_sender, option.clone(), manager.clone())
+            .await
+            .unwrap();
+        let ctx = Context::new(
+            manager.clone(),
+            Arc::new(NoCache::default()),
+            version_set,
+            TestSchema.arrow_schema().clone(),
+        );
+
+        let executor = Arc::new(TokioExecutor::current());
+        println!("start major compaction");
+        LeveledCompactor::<Test, TokioExecutor>::major_compaction(
+            &version,
+            &option,
+            &min,
+            &max,
+            &mut version_edits,
+            &mut vec![],
+            &Arc::new(TestSchema),
+            &ctx,
+            &executor,
+            false,
+        )
+        .await
+        .unwrap();
+        println!("end major compaction");
         if let VersionEdit::Add { level, scope } = &version_edits[0] {
             assert_eq!(*level, 1);
             assert_eq!(scope.min, 1.to_string());
@@ -913,6 +994,7 @@ pub(crate) mod tests {
             version_set,
             TestSchema.arrow_schema().clone(),
         );
+        let executor = Arc::new(TokioExecutor::current());
         LeveledCompactor::<Test, TokioExecutor>::major_compaction(
             &version,
             &option,
@@ -920,9 +1002,10 @@ pub(crate) mod tests {
             &max,
             &mut version_edits,
             &mut vec![],
-            Arc::new(TestSchema),
+            &Arc::new(TestSchema),
             &ctx,
-            Arc::new(TokioExecutor::current()),
+            &executor,
+            false,
         )
         .await
         .unwrap();

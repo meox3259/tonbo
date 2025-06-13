@@ -153,7 +153,7 @@ where
                 .option
                 .level_fs_path(leve)
                 .unwrap_or(&self.option.base_path);
-            let level_fs = manager.get_fs(level_path);
+            let level_fs = manager.get_cache(level_path);
             if sort_runs.is_empty() {
                 continue;
             }
